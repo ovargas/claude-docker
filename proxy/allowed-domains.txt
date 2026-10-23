@@ -20,6 +20,11 @@
 .debian.org
 .alpinelinux.org
 
+# Python packages (Python is in the base image). pip resolves on pypi.org
+# and downloads from files.pythonhosted.org.
+pypi.org
+files.pythonhosted.org
+
 # MCP servers (see mcp-allowed.txt)
 ovargas.youtrack.cloud
 
