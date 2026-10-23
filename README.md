@@ -142,7 +142,8 @@ To add a stack, create `stacks/<name>/Dockerfile` starting with
 - `~/.claude/settings.json` and `statusline-command.sh`. Paths under
   `~/.claude` are rewritten to the sandbox home, hooks that call other host
   files (e.g. iTerm's `cc-status`) are dropped, and GitHub marketplaces
-  switch to HTTPS git URLs. Merged over the sandbox's own settings.
+  switch to HTTPS git URLs. The status line gets a yellow `[sandbox]`
+  prefix. Merged over the sandbox's own settings.
 - every GitHub marketplace in `~/.claude/plugins/known_marketplaces.json`,
   added by HTTPS URL
 - every plugin enabled in `~/.claude/settings.json`, installed in the sandbox,

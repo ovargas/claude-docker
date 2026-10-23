@@ -302,7 +302,8 @@ sync_mcp_servers() {
 # Host settings.json, adapted: paths under ~/.claude point to the sandbox
 # home, hooks calling anything else on the host (e.g. iTerm's cc-status)
 # are dropped, since those files don't exist in the container, and GitHub
-# marketplaces use HTTPS git URLs like the ones sync adds below. Merged over
+# marketplaces use HTTPS git URLs like the ones sync adds below. The status
+# line gets a [sandbox] prefix, since paths look the same as on the host. Merged over
 # the sandbox's own settings so its plugin/marketplace entries survive.
 # Only this copy is written: nothing flows back to the host's ~/.claude.
 # Plugin ids listed in plugins-excluded.txt, one per line
@@ -339,7 +340,10 @@ sync_settings() {
             else . end)
         else . end
       | $sandbox[0] * .
-      | reduce $excluded[] as $p (.; .enabledPlugins[$p] = false)' \
+      | reduce $excluded[] as $p (.; .enabledPlugins[$p] = false)
+      | .statusLine = {type: "command", command: (
+          "printf \"\\033[33m[sandbox]\\033[0m \""
+          + (if .statusLine.command then "; " + .statusLine.command else "" end))}' \
       "${src}/settings.json" > "${tmp}"
   cat "${tmp}" > "${current}" && rm -f "${tmp}"
   echo "✓ settings.json copied (host-only hooks dropped)"
