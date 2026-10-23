@@ -1,0 +1,3 @@
+# Node binaries (mise) and the npm registry (npm, pnpm, yarn via corepack)
+nodejs.org
+registry.npmjs.org

@@ -1,0 +1,6 @@
+# Go module proxy, its checksum database, and the storage it redirects
+# large modules and toolchains to. Public downloads only: the sandbox holds
+# no cloud credentials.
+proxy.golang.org
+sum.golang.org
+storage.googleapis.com

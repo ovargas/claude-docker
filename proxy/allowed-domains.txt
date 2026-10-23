@@ -1,0 +1,26 @@
+# Domains the sandbox may reach. One per line.
+# A leading dot matches the domain and all its subdomains (.github.com -> api.github.com).
+# Apply changes with: dclaude proxy-reload
+
+# Claude Code
+.anthropic.com
+.claude.ai
+.claude.com
+
+# GitHub (git, gh CLI, release downloads)
+.github.com
+.githubusercontent.com
+
+# Docker Hub (image pulls from dind)
+.docker.io
+.docker.com
+
+# Distro packages used inside the sandbox image and test containers
+.ubuntu.com
+.debian.org
+.alpinelinux.org
+
+# MCP servers (see mcp-allowed.txt)
+ovargas.youtrack.cloud
+
+# TODO: package registries and services your projects need

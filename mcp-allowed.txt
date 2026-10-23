@@ -1,0 +1,5 @@
+# MCP servers from your host ~/.claude.json that `dclaude sync` copies into
+# the sandbox, one name per line. Their credentials (headers, env) are copied
+# too, and the agent runs in YOLO mode: list only what you'd let it use
+# unattended. Each server's domain must also be in proxy/allowed-domains.txt.
+youtrack

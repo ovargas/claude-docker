@@ -1,0 +1,91 @@
+# Sandbox for one repo: claude + its own Docker daemon + egress proxy.
+# Started by the `dclaude` launcher, which sets the project name
+# (one sandbox per repo), PROJECT_DIR, SANDBOX_HOME, HOST_GITCONFIG,
+# CLAUDE_IMAGE (base + stacks) and ALLOWED_DOMAINS, builds the claude image,
+# and adds a generated override with the sibling-repo mounts.
+
+networks:
+  # No route to the internet: everything has to go through the proxy
+  sandbox:
+    internal: true
+  egress: {}
+
+volumes:
+  # Image/layer cache of the inner daemon, kept across `dclaude down`
+  dind-data: {}
+  # Toolchain and package caches (Go modules, Node versions, pnpm store),
+  # shared by every sandbox. External (created by dclaude) so that one
+  # repo's `dclaude destroy` doesn't wipe it for the others.
+  cache:
+    name: dclaude-cache
+    external: true
+
+x-proxy-env: &proxy-env
+  HTTP_PROXY: http://proxy:3128
+  HTTPS_PROXY: http://proxy:3128
+  NO_PROXY: localhost,127.0.0.1,::1
+  http_proxy: http://proxy:3128
+  https_proxy: http://proxy:3128
+  no_proxy: localhost,127.0.0.1,::1
+  # Node's built-in fetch (corepack, many CLIs) ignores the vars above without it
+  NODE_USE_ENV_PROXY: "1"
+
+services:
+  proxy:
+    build: ./proxy
+    image: claude-sandbox-proxy:latest
+    volumes:
+      # proxy/allowed-domains.txt plus the stacks' lists, merged by dclaude
+      - ${ALLOWED_DOMAINS:-./proxy/allowed-domains.txt}:/etc/squid/allowed-domains.txt:ro
+    networks: [sandbox, egress]
+    restart: unless-stopped
+
+  dind:
+    image: docker:29-dind
+    privileged: true
+    environment:
+      <<: *proxy-env
+      # Plain TCP is fine: the daemon port only exists in this sandbox's network namespace
+      DOCKER_TLS_CERTDIR: ""
+    volumes:
+      - dind-data:/var/lib/docker
+      # Same path as on the host so bind mounts in the project's compose resolve
+      - ${PROJECT_DIR:?}:${PROJECT_DIR:?}
+    networks: [sandbox]
+    depends_on: [proxy]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  claude:
+    # Built by dclaude: claude-sandbox:base plus the repo's stack layers
+    image: ${CLAUDE_IMAGE:-claude-sandbox:base}
+    # Share dind's network namespace: ports published by the project's
+    # containers are reachable on localhost, exactly like on the host
+    network_mode: service:dind
+    environment:
+      <<: *proxy-env
+      DOCKER_HOST: tcp://localhost:2375
+      # Scoped, repo-limited token. Never your personal GH_TOKEN.
+      GH_TOKEN: ${SANDBOX_GH_TOKEN:-}
+      SSH_AUTH_SOCK: /run/host-services/ssh-auth.sock
+      GIT_CONFIG_GLOBAL: /etc/host-gitconfig
+    volumes:
+      - ${PROJECT_DIR:?}:${PROJECT_DIR:?}
+      # Sandbox-only home: Claude login, settings, history. Not your real ~/.claude.
+      - ${SANDBOX_HOME:?}:/home/claude
+      - cache:/cache
+      # Outside the home mount: nested bind mounts fail on Docker Desktop
+      # Filtered copy of ~/.gitconfig written by dclaude (no url.* rewrites)
+      - ${HOST_GITCONFIG:?}:/etc/host-gitconfig:ro
+      # Docker Desktop's forwarded SSH agent: keys can be used, never read
+      - /run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock
+    # The forwarded SSH agent socket is root:root 0660
+    group_add: ["0"]
+    depends_on:
+      dind:
+        condition: service_healthy
+    restart: unless-stopped

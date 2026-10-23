@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# dclaude — run Claude Code in YOLO mode inside an isolated sandbox for the
+# current repo. Sibling repos (the parent folder) are mounted read-only so the
+# agent can read their docs and contracts. See README.md.
+#
+# Usage:
+#   dclaude [claude args]   start the sandbox and open Claude in $PWD
+#   dclaude shell [args]    bash inside the sandbox (args go to bash)
+#   dclaude mounts          show what the sandbox sees and with which access
+#   dclaude sync            copy CLAUDE.md, skills and plugins from the host
+#   dclaude down            stop this repo's sandbox (keeps image cache)
+#   dclaude destroy         stop it and delete its image cache
+#   dclaude rebuild         rebuild images (also updates Claude Code)
+#   dclaude proxy-reload    re-read proxy/allowed-domains.txt
+#   dclaude proxy-logs      follow proxy logs (look for TCP_DENIED)
+#   dclaude ps              list running sandboxes
+#
+# Environment:
+#   DCLAUDE_HOME            sandbox $HOME on the host (default ~/.claude-docker)
+#   DCLAUDE_NO_SIBLINGS=1   mount only the current repo
+#   DCLAUDE_STACKS="go node"  force the image stacks for this run
+
+set -euo pipefail
+
+SANDBOX_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+export SANDBOX_HOME="${DCLAUDE_HOME:-${HOME}/.claude-docker}"
+
+# Generated mount lists. Must stay outside every folder the sandbox can write,
+# or the agent could edit its own mounts for the next launch.
+STATE_DIR="${HOME}/.cache/dclaude"
+
+# File names hidden in sibling repos (an empty file is mounted on top)
+SECRET_NAMES=('.env' '.env.*' '*.pem' '*.key' '*.p12' '*.pfx' '.npmrc' '.pypirc'
+              '.netrc' 'credentials.json' 'service-account*.json' '*.tfvars')
+# Templates that look like secrets but are meant to be read
+SECRET_EXCEPTIONS=('*.example' '*.sample' '*.template')
+
+# ─── Resolve the repo ──────────────────────────────────────────────────────
+# From a worktree, --git-common-dir points at the main repo's .git, so the
+# main repo (and the .git the worktree depends on) is the writable one
+if common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+  PROJECT_DIR="$(dirname "${common_dir}")"
+else
+  PROJECT_DIR="$(pwd)"
+fi
+export PROJECT_DIR
+CONTEXT_DIR="$(dirname "${PROJECT_DIR}")"
+WORKTREES_DIR="${PROJECT_DIR}-worktrees"
+
+is_broad() {
+  case "$1" in
+    "/" | "${HOME}" | "$(dirname "${HOME}")" | "${HOME}/projects") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if is_broad "${PROJECT_DIR}"; then
+  echo "dclaude: refusing to mount ${PROJECT_DIR}; run it inside a repo." >&2
+  exit 1
+fi
+
+SIBLINGS=true
+if [[ "${DCLAUDE_NO_SIBLINGS:-}" == "1" ]] || is_broad "${CONTEXT_DIR}"; then
+  SIBLINGS=false
+fi
+
+# One compose project per repo: name + short path hash avoids collisions
+# between repos with the same folder name
+repo_name="$(basename "${PROJECT_DIR}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-')"
+path_hash="$(printf '%s' "${PROJECT_DIR}" | shasum | cut -c1-6)"
+PROJECT_NAME="sandbox-${repo_name}-${path_hash}"
+MOUNTS_FILE="${STATE_DIR}/${PROJECT_NAME}.mounts.yaml"
+
+# ─── Image stacks ──────────────────────────────────────────────────────────
+# The claude image is the base plus one layer per stack (stacks/<name>/),
+# chained in alphabetical order: claude-sandbox:base -> :go -> :go-node.
+
+# Prints the stacks this repo needs, one per line, by looking at the files in
+# PROJECT_DIR up to two levels deep (node_modules, vendor and .git ignored).
+# Only names with a stacks/<name>/Dockerfile are valid.
+detect_stacks() {
+  # TODO(you): map project files to stacks. Examples to weigh: go.mod -> go,
+  # package.json -> node, pubspec.yaml -> flutter (no layer yet). Should a
+  # package.json under a Go repo's tools/ count? What about examples/ dirs?
+  return 0
+}
+
+# stacks.conf rule for PROJECT_DIR, if any: prints "match <stacks...>"
+stacks_from_conf() {
+  local conf="${SANDBOX_DIR}/stacks.conf" pattern rest
+  [[ -f "${conf}" ]] || return 0
+  while read -r pattern rest; do
+    [[ -z "${pattern}" || "${pattern}" == \#* ]] && continue
+    pattern="${pattern/#\~/${HOME}}"
+    # shellcheck disable=SC2053  # unquoted on purpose: glob match
+    if [[ "${PROJECT_DIR}" == ${pattern} ]]; then
+      echo "match ${rest}"
+      return 0
+    fi
+  done < "${conf}"
+}
+
+resolve_stacks() {
+  local raw conf_rule s out=""
+  if [[ -n "${DCLAUDE_STACKS+x}" ]]; then
+    raw="${DCLAUDE_STACKS}"
+  elif conf_rule="$(stacks_from_conf)" && [[ -n "${conf_rule}" ]]; then
+    raw="${conf_rule#match}"
+  else
+    raw="$(detect_stacks)"
+  fi
+  for s in $(printf '%s\n' ${raw} | sort -u); do
+    if [[ ! -f "${SANDBOX_DIR}/stacks/${s}/Dockerfile" ]]; then
+      echo "dclaude: unknown stack '${s}' (no stacks/${s}/Dockerfile)" >&2
+      exit 1
+    fi
+    out="${out:+${out} }${s}"
+  done
+  echo "${out}"
+}
+
+STACKS="$(resolve_stacks)"
+export CLAUDE_IMAGE="claude-sandbox:${STACKS:+${STACKS// /-}}"
+[[ -z "${STACKS}" ]] && CLAUDE_IMAGE="claude-sandbox:base"
+
+# Builds one layer unless an image with the same recipe hash already exists.
+# The hash covers every file of this layer and the ones below it, so editing
+# the base Dockerfile rebuilds all stacks on top of it.
+build_layer() {  # build_layer <tag> <parent tag or ""> <dockerfile> <hash>
+  local tag="$1" parent="$2" dockerfile="$3" hash="$4" current pull=()
+  current="$(docker image inspect -f '{{ index .Config.Labels "dclaude.recipe" }}' "${tag}" 2>/dev/null || true)"
+  [[ "${current}" == "${hash}" && -z "${FORCE_BUILD:-}" ]] && return 0
+  echo "Building ${tag}…" >&2
+  [[ -z "${parent}" && -n "${FORCE_BUILD:-}" ]] && pull=(--pull)
+  docker build -q ${pull[@]+"${pull[@]}"} ${FORCE_BUILD:+--no-cache} \
+    --label "dclaude.recipe=${hash}" --build-arg "BASE=${parent}" \
+    -t "${tag}" -f "${dockerfile}" "$(dirname "${dockerfile}")" >/dev/null
+}
+
+ensure_image() {
+  local recipe tag="claude-sandbox:base" parent name="" s
+  recipe="$(cat "${SANDBOX_DIR}/Dockerfile" "${SANDBOX_DIR}/docker-client-config.json")"
+  build_layer "${tag}" "" "${SANDBOX_DIR}/Dockerfile" "$(printf '%s' "${recipe}" | shasum | cut -c1-12)"
+  for s in ${STACKS}; do
+    parent="${tag}"
+    name="${name:+${name}-}${s}"
+    tag="claude-sandbox:${name}"
+    recipe="${recipe}$(cat "${SANDBOX_DIR}/stacks/${s}/Dockerfile")"
+    build_layer "${tag}" "${parent}" "${SANDBOX_DIR}/stacks/${s}/Dockerfile" \
+      "$(printf '%s' "${recipe}" | shasum | cut -c1-12)"
+  done
+}
+
+# Proxy allowlist for this sandbox: the shared list plus each stack's list.
+# Rewritten in place because the running proxy has it bind-mounted by inode.
+export ALLOWED_DOMAINS="${STATE_DIR}/${PROJECT_NAME}.allowed-domains.txt"
+write_allowlist() {
+  local files=("${SANDBOX_DIR}/proxy/allowed-domains.txt") s
+  for s in ${STACKS}; do
+    [[ -f "${SANDBOX_DIR}/stacks/${s}/allowed-domains.txt" ]] \
+      && files+=("${SANDBOX_DIR}/stacks/${s}/allowed-domains.txt")
+  done
+  mkdir -p "${STATE_DIR}"
+  grep -hvE '^[[:space:]]*(#|$)' "${files[@]}" | sort -u > "${ALLOWED_DOMAINS}.tmp"
+  cat "${ALLOWED_DOMAINS}.tmp" > "${ALLOWED_DOMAINS}"
+  rm -f "${ALLOWED_DOMAINS}.tmp"
+}
+
+# Installs the toolchain versions the project pins (mise reads .nvmrc etc.)
+install_pinned_tools() {
+  case " ${STACKS} " in
+    *" node "*) compose exec -T -w "${PROJECT_DIR}" claude mise install --quiet </dev/null || true ;;
+  esac
+}
+
+compose() {
+  local files=(-f "${SANDBOX_DIR}/compose.yaml")
+  [[ -f "${MOUNTS_FILE}" ]] && files+=(-f "${MOUNTS_FILE}")
+  docker compose -p "${PROJECT_NAME}" "${files[@]}" "$@"
+}
+
+# ─── Secrets in sibling repos ──────────────────────────────────────────────
+# Prints one path per line: secret-looking files by name, plus any small JSON
+# holding a private key (GCP/Firebase service accounts have arbitrary names)
+find_secret_files() {
+  local name_args=() except_args=() n
+  for n in "${SECRET_NAMES[@]}"; do name_args+=(-o -name "${n}"); done
+  for n in "${SECRET_EXCEPTIONS[@]}"; do except_args+=(! -name "${n}"); done
+
+  local prune=(\( -name node_modules -o -name .git -o -name vendor -o -name .venv
+               -o -path "${PROJECT_DIR}" -o -path "${WORKTREES_DIR}" \) -prune -o)
+
+  find "${CONTEXT_DIR}" -maxdepth 6 "${prune[@]}" \
+    -type f \( "${name_args[@]:1}" \) "${except_args[@]}" -print
+  find "${CONTEXT_DIR}" -maxdepth 4 "${prune[@]}" \
+    -type f -name '*.json' -size -64k -print0 \
+    | xargs -0 grep -l '"private_key"' 2>/dev/null || true
+}
+
+yaml_quote() {
+  local s="${1//\\/\\\\}"
+  printf '"%s"' "${s//\"/\\\"}"
+}
+
+bind() {  # bind <source> <target> [ro]
+  printf '      - type: bind\n        source: %s\n        target: %s\n' \
+    "$(yaml_quote "$1")" "$(yaml_quote "$2")"
+  [[ "${3:-}" == "ro" ]] && printf '        read_only: true\n'
+  return 0
+}
+
+# Writes the per-repo compose override with the dynamic mounts.
+# Long bind syntax on purpose: on Docker Desktop, `-v path:path:ro` with a
+# long identical source/target silently produces an empty mount.
+write_mounts() {
+  mkdir -p "${STATE_DIR}" "${WORKTREES_DIR}"
+  {
+    echo "# Generated by dclaude for ${PROJECT_DIR}. Do not edit."
+    echo "services:"
+    echo "  claude:"
+    echo "    volumes:"
+    bind "${WORKTREES_DIR}" "${WORKTREES_DIR}"
+    if [[ "${SIBLINGS}" == "true" ]]; then
+      bind "${CONTEXT_DIR}" "${CONTEXT_DIR}" ro
+      find_secret_files | sort -u | while IFS= read -r f; do
+        bind /dev/null "${f}" ro
+      done
+    fi
+    # dind never gets the siblings: it is privileged and the agent drives it
+    echo "  dind:"
+    echo "    volumes:"
+    bind "${WORKTREES_DIR}" "${WORKTREES_DIR}"
+  } > "${MOUNTS_FILE}"
+}
+
+# The host's ~/.gitconfig minus `url.*` rewrites: the sandbox talks to
+# GitHub over HTTPS, so rules forcing git@github.com would break clones
+export HOST_GITCONFIG="${STATE_DIR}/gitconfig"
+write_gitconfig() {
+  mkdir -p "${STATE_DIR}"
+  local tmp="${HOST_GITCONFIG}.tmp"
+  if [[ -f "${HOME}/.gitconfig" ]]; then
+    cp "${HOME}/.gitconfig" "${tmp}"
+  else
+    : > "${tmp}"
+  fi
+  git config --file "${tmp}" --name-only --get-regexp '^url\.' 2>/dev/null \
+    | sed 's/\.[^.]*$//' | sort -u \
+    | while IFS= read -r section; do
+        git config --file "${tmp}" --remove-section "${section}"
+      done
+  # Rewrite in place: a running sandbox has this file bind-mounted by inode,
+  # so replacing it (mv, git config's lock+rename) would leave it dangling
+  cat "${tmp}" > "${HOST_GITCONFIG}"
+  rm -f "${tmp}"
+}
+
+ensure_up() {
+  mkdir -p "${SANDBOX_HOME}"
+  ensure_image
+  docker volume create dclaude-cache >/dev/null
+  write_gitconfig
+  write_allowlist
+  write_mounts
+  compose up -d --wait --quiet-pull >/dev/null
+  install_pinned_tools
+}
+
+show_mounts() {
+  write_mounts
+  echo "image   ${CLAUDE_IMAGE}"
+  echo "rw      ${PROJECT_DIR}"
+  echo "rw      ${WORKTREES_DIR}"
+  if [[ "${SIBLINGS}" == "true" ]]; then
+    echo "ro      ${CONTEXT_DIR}"
+    grep -A1 'source: "/dev/null"' "${MOUNTS_FILE}" | sed -n 's/.*target: "\(.*\)"/hidden  \1/p'
+  else
+    echo "(no sibling repos mounted)"
+  fi
+}
+
+# ─── Host config → sandbox (one way) ───────────────────────────────────────
+# Copies instead of mounting: the agent may change its copy, never the host's
+
+# Copies the user-scope MCP servers named in mcp-allowed.txt, replacing the
+# sandbox's whole mcpServers map so removing a name also revokes it
+sync_mcp_servers() {
+  local allow="${SANDBOX_DIR}/mcp-allowed.txt" dst="${SANDBOX_HOME}/.claude.json"
+  local names
+  names="$({ grep -vE '^[[:space:]]*(#|$)' "${allow}" 2>/dev/null || true; } | jq -R . | jq -sc .)"
+  [[ -f "${dst}" ]] || echo '{}' > "${dst}"
+
+  jq --argjson names "${names}" --slurpfile host "${HOME}/.claude.json" '
+    .mcpServers = ($host[0].mcpServers // {} | with_entries(select(.key as $k | $names | index($k))))
+  ' "${dst}" > "${dst}.tmp" && mv "${dst}.tmp" "${dst}"
+
+  local missing
+  missing="$(jq -r --argjson names "${names}" '$names - (.mcpServers | keys) | .[]' "${dst}")"
+  [[ -n "${missing}" ]] && echo "⚠ not in host ~/.claude.json: ${missing}"
+  echo "✓ MCP servers: $(jq -r '.mcpServers | keys | join(", ") | if . == "" then "none" else . end' "${dst}")"
+}
+# Host settings.json, adapted: paths under ~/.claude point to the sandbox
+# home, hooks calling anything else on the host (e.g. iTerm's cc-status)
+# are dropped, since those files don't exist in the container, and GitHub
+# marketplaces use HTTPS git URLs like the ones sync adds below. Merged over
+# the sandbox's own settings so its plugin/marketplace entries survive.
+# Only this copy is written: nothing flows back to the host's ~/.claude.
+sync_settings() {
+  local src="${HOME}/.claude" dst="${SANDBOX_HOME}/.claude"
+  [[ -f "${src}/settings.json" ]] || return 0
+  [[ -f "${src}/statusline-command.sh" ]] \
+    && cp "${src}/statusline-command.sh" "${dst}/statusline-command.sh"
+
+  local current="${dst}/settings.json" tmp
+  [[ -f "${current}" ]] || echo '{}' > "${current}"
+  tmp="$(mktemp)"
+  jq --arg from "${src}/" --arg to "/home/claude/.claude/" --arg home "${HOME}/" \
+    --slurpfile sandbox "${current}" '
+      walk(if type == "string" then (split($from) | join($to)) else . end)
+      | if .hooks then
+          .hooks |= (map_values(
+              map(.hooks |= map(select((.command // "") | contains($home) | not)))
+              | map(select(.hooks | length > 0)))
+            | with_entries(select(.value | length > 0)))
+        else . end
+      | if .hooks == {} then del(.hooks) else . end
+      | if .extraKnownMarketplaces then
+          .extraKnownMarketplaces |= map_values(
+            if .source.source == "github"
+            then .source = {source: "git", url: "https://github.com/\(.source.repo).git"}
+            else . end)
+        else . end
+      | $sandbox[0] * .' "${src}/settings.json" > "${tmp}"
+  cat "${tmp}" > "${current}" && rm -f "${tmp}"
+  echo "✓ settings.json copied (host-only hooks dropped)"
+}
+
+sync_host_config() {
+  local src="${HOME}/.claude" dst="${SANDBOX_HOME}/.claude"
+  mkdir -p "${dst}"
+  [[ -f "${src}/CLAUDE.md" ]] && cp "${src}/CLAUDE.md" "${dst}/CLAUDE.md"
+  [[ -d "${src}/skills" ]] && rsync -aL --delete "${src}/skills/" "${dst}/skills/"
+  echo "✓ CLAUDE.md and skills copied"
+  sync_settings
+  sync_mcp_servers
+
+  # HTTPS URLs: `owner/repo` would make Claude clone over SSH.
+  # One failing plugin must not stop the rest.
+  ensure_up
+  jq -r '.[].source | select(.source == "github") | .repo' \
+      "${src}/plugins/known_marketplaces.json" \
+    | while IFS= read -r repo; do
+        compose exec -T claude claude plugin marketplace add "https://github.com/${repo}.git" </dev/null \
+          || echo "⚠ marketplace ${repo} failed"
+      done
+  jq -r '.enabledPlugins // {} | to_entries[] | select(.value) | .key' "${src}/settings.json" \
+    | while IFS= read -r plugin; do
+        compose exec -T claude claude plugin install "${plugin}" </dev/null \
+          || echo "⚠ plugin ${plugin} failed"
+      done
+}
+
+case "${1:-}" in
+  shell)
+    ensure_up
+    compose exec -w "${PWD}" claude bash "${@:2}" ;;
+  mounts)
+    show_mounts ;;
+  sync)
+    sync_host_config ;;
+  down)
+    compose down ;;
+  destroy)
+    compose down --volumes ;;
+  rebuild)
+    compose build --pull --no-cache proxy
+    FORCE_BUILD=1 ensure_image ;;
+  proxy-reload)
+    write_allowlist
+    compose restart proxy ;;
+  proxy-logs)
+    compose logs -f proxy ;;
+  ps)
+    exec docker ps --filter "label=com.docker.compose.service=claude" \
+      --format 'table {{.Label "com.docker.compose.project"}}\t{{.Status}}' ;;
+  *)
+    ensure_up
+    compose exec -w "${PWD}" claude claude --dangerously-skip-permissions "$@" ;;
+esac
