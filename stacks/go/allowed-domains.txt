@@ -4,3 +4,5 @@
 proxy.golang.org
 sum.golang.org
 storage.googleapis.com
+# Vulnerability database used by govulncheck
+vuln.go.dev
