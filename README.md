@@ -145,7 +145,9 @@ To add a stack, create `stacks/<name>/Dockerfile` starting with
   switch to HTTPS git URLs. Merged over the sandbox's own settings.
 - every GitHub marketplace in `~/.claude/plugins/known_marketplaces.json`,
   added by HTTPS URL
-- every plugin enabled in `~/.claude/settings.json`, installed in the sandbox
+- every plugin enabled in `~/.claude/settings.json`, installed in the sandbox,
+  except those in `plugins-excluded.txt` (skipped, disabled, and uninstalled
+  if a previous sync installed them)
 - the MCP servers listed in `mcp-allowed.txt`, copied from `~/.claude.json`
   with their credentials. The list replaces the sandbox's MCP config, so
   removing a name and syncing again revokes it. Add each server's domain to

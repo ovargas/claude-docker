@@ -1,0 +1,5 @@
+# Host plugins that `dclaude sync` keeps out of the sandbox, one
+# plugin@marketplace per line. They are skipped, disabled in the sandbox's
+# settings and uninstalled if a previous sync installed them.
+figma@claude-plugins-official
+stripe@claude-plugins-official

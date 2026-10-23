@@ -305,6 +305,13 @@ sync_mcp_servers() {
 # marketplaces use HTTPS git URLs like the ones sync adds below. Merged over
 # the sandbox's own settings so its plugin/marketplace entries survive.
 # Only this copy is written: nothing flows back to the host's ~/.claude.
+# Plugin ids listed in plugins-excluded.txt, one per line
+excluded_plugins() {
+  local f="${SANDBOX_DIR}/plugins-excluded.txt"
+  [[ -f "${f}" ]] || return 0
+  grep -vE '^[[:space:]]*(#|$)' "${f}" || true
+}
+
 sync_settings() {
   local src="${HOME}/.claude" dst="${SANDBOX_HOME}/.claude"
   [[ -f "${src}/settings.json" ]] || return 0
@@ -315,6 +322,7 @@ sync_settings() {
   [[ -f "${current}" ]] || echo '{}' > "${current}"
   tmp="$(mktemp)"
   jq --arg from "${src}/" --arg to "/home/claude/.claude/" --arg home "${HOME}/" \
+    --argjson excluded "$(excluded_plugins | jq -R . | jq -sc .)" \
     --slurpfile sandbox "${current}" '
       walk(if type == "string" then (split($from) | join($to)) else . end)
       | if .hooks then
@@ -330,7 +338,9 @@ sync_settings() {
             then .source = {source: "git", url: "https://github.com/\(.source.repo).git"}
             else . end)
         else . end
-      | $sandbox[0] * .' "${src}/settings.json" > "${tmp}"
+      | $sandbox[0] * .
+      | reduce $excluded[] as $p (.; .enabledPlugins[$p] = false)' \
+      "${src}/settings.json" > "${tmp}"
   cat "${tmp}" > "${current}" && rm -f "${tmp}"
   echo "✓ settings.json copied (host-only hooks dropped)"
 }
@@ -353,7 +363,14 @@ sync_host_config() {
         compose exec -T claude claude plugin marketplace add "https://github.com/${repo}.git" </dev/null \
           || echo "⚠ marketplace ${repo} failed"
       done
+  local excluded
+  excluded="$(excluded_plugins)"
+  for plugin in ${excluded}; do
+    compose exec -T claude claude plugin uninstall "${plugin}" </dev/null >/dev/null 2>&1 \
+      && echo "✓ plugin ${plugin} uninstalled (excluded)"
+  done
   jq -r '.enabledPlugins // {} | to_entries[] | select(.value) | .key' "${src}/settings.json" \
+    | { grep -vxF -- "${excluded}" || true; } \
     | while IFS= read -r plugin; do
         compose exec -T claude claude plugin install "${plugin}" </dev/null \
           || echo "⚠ plugin ${plugin} failed"
